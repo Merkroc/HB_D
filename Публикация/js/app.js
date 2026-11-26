@@ -634,16 +634,65 @@
     lb.root.classList.remove('is-loading');
   }
 
+  /* --------------------------------------------------------------------
+     Звук живого кадра и песня: одновременно им тесно — особенно на iPhone,
+     где браузер вообще не даёт менять громкость элемента. Поэтому, пока
+     живой кадр звучит, песня уходит на второй план (а где громкость не
+     работает — встаёт на паузу), и обязательно возвращается, когда кадр
+     замолчал. Иначе музыка так и оставалась бы выключенной.
+     -------------------------------------------------------------------- */
+  var lbAudioBusy = false;
+  var lbAudioRelease = null;
+  var lbAudioSafety = null;
+
+  function releaseLbAudio() {
+    if (lbAudioRelease) { clearTimeout(lbAudioRelease); lbAudioRelease = null; }
+    if (lbAudioSafety) { clearTimeout(lbAudioSafety); lbAudioSafety = null; }
+    if (!lbAudioBusy) return;
+    lbAudioBusy = false;
+    if (!window.Music) return;
+    window.Music.setDucked(false);
+    if (window.Music.resume) window.Music.resume();
+  }
+
+  function setLbAudio(on, immediate) {
+    if (lbAudioRelease) { clearTimeout(lbAudioRelease); lbAudioRelease = null; }
+    if (on) {
+      if (lbAudioBusy) return;
+      lbAudioBusy = true;
+      if (window.Music) window.Music.setDucked(true);
+      /* страховка: если кадр так и не зазвучал — песня всё равно вернётся */
+      if (lbAudioSafety) clearTimeout(lbAudioSafety);
+      lbAudioSafety = window.setTimeout(function () {
+        lbAudioSafety = null;
+        if (!lb.video || lb.video.paused || lb.video.muted) releaseLbAudio();
+      }, 2000);
+      return;
+    }
+    if (lbAudioSafety) { clearTimeout(lbAudioSafety); lbAudioSafety = null; }
+    if (!lbAudioBusy) return;
+    if (immediate) { releaseLbAudio(); return; }
+    /* соседний живой кадр может зазвучать через мгновение — не дёргаем песню зря */
+    lbAudioRelease = window.setTimeout(function () {
+      lbAudioRelease = null;
+      releaseLbAudio();
+    }, 220);
+  }
+
   function playLbVideo(p) {
     var v = lb.video;
     if (!v || !p.live) return;
     v.muted = !lbSoundOn;
+    /* кадр зазвучит — сразу уступаем ему аудио, чтобы песня не мешала
+       и не «дралась» с ним за звук на телефоне */
+    setLbAudio(!v.muted, true);
     v.src = p.live.src;
     try { v.load(); } catch (e) { /* ignore */ }
     var pr = v.play();
     if (pr && pr.catch) {
       pr.catch(function () {
         v.muted = true;
+        setLbAudio(false, true);
         var again = v.play();
         if (again && again.catch) again.catch(function () {});
       });
@@ -705,7 +754,6 @@
     if (lb.root.hidden) lb.root.hidden = false;
     renderSlide(index);
     requestAnimationFrame(function () { lb.root.classList.add('is-open'); });
-    if (window.Music) window.Music.setDucked(true);
     window.setTimeout(function () {
       if (!lbOpen) return;
       var target = lb.dialog || lb.close;
@@ -724,7 +772,7 @@
     }
     document.body.classList.remove('lb-open');
     document.documentElement.classList.remove('lb-open');
-    if (window.Music) window.Music.setDucked(false);
+    setLbAudio(false, true);
     window.setTimeout(function () {
       if (!lbOpen) {
         lb.root.hidden = true;
@@ -755,8 +803,18 @@
     lb.dialog = $('.lightbox__dialog', lb.root);
 
     if (lb.video) {
-      lb.video.addEventListener('error', showVideoFallback);
+      lb.video.addEventListener('error', function () {
+        showVideoFallback();
+        setLbAudio(false, true);
+      });
       lb.video.addEventListener('loadeddata', function () { lb.root.classList.remove('is-loading'); });
+      /* живой кадр зазвучал — уступаем звук; замолчал — возвращаем песню */
+      lb.video.addEventListener('playing', function () {
+        if (lb.video.muted) { setLbAudio(false, true); return; }
+        setLbAudio(true);
+      });
+      lb.video.addEventListener('pause', function () { setLbAudio(false); });
+      lb.video.addEventListener('ended', function () { setLbAudio(false); });
     }
 
     $$('[data-close]', lb.root).forEach(function (el) {
@@ -772,8 +830,11 @@
         lbSoundOn = !lbSoundOn;
         if (lb.video) lb.video.muted = !lbSoundOn;
         if (lbSoundOn && lb.video) {
+          setLbAudio(true);
           var pr = lb.video.play();
-          if (pr && pr.catch) pr.catch(function () {});
+          if (pr && pr.catch) pr.catch(function () { setLbAudio(false, true); });
+        } else {
+          setLbAudio(false, true);
         }
         syncLbSound();
       });

@@ -8,6 +8,7 @@
    Публичный интерфейс: window.Music
      Music.start() / Music.stop() / Music.toggle()
      Music.setDucked(true|false)   — приглушить, пока играет живой кадр
+     Music.resume()                — вернуть песню, если её «придержали»
      Music.mode                    — 'track' | 'synth' | null
      Music.title                   — что сейчас играет
      Music.onModeChange(fn)        — колбэк, когда режим определился
@@ -33,6 +34,20 @@
   var AC = window.AudioContext || window.webkitAudioContext;
   var hasAudioEl = typeof Audio !== 'undefined';
 
+  /* На iPhone/iPad браузер игнорирует el.volume: выставить громкость нельзя.
+     Там «приглушить» = честно поставить паузу, а потом вернуть песню. */
+  var volumeSettable = (function () {
+    try {
+      var probe = new Audio();
+      probe.volume = 0.25;
+      var ok = Math.abs(probe.volume - 0.25) < 0.02;
+      probe.volume = 1;
+      return ok;
+    } catch (e) {
+      return true;
+    }
+  })();
+
   var enabled = false;
   var started = false;
   var ducked = false;
@@ -46,6 +61,8 @@
   var trackIndex = -1;
   var trackFadeTimer = null;
   var trackProbeFinished = false;
+  var resumeTries = 0;
+  var resumeTimer = null;
 
   function volumeTarget() {
     if (!enabled) return 0;
@@ -70,6 +87,36 @@
         trackFadeTimer = null;
       }
     }, 40);
+  }
+
+  /* ---------- возвращаем песню, если её поставили на паузу снаружи ----------
+     Так бывает, когда зазвучал живой кадр, когда система отдала звук другому
+     приложению или когда паузу «придержал» сам браузер. Свои паузы не трогаем:
+     возвращаемся только тогда, когда музыка действительно должна играть. */
+  function cancelResume() {
+    if (resumeTimer) {
+      clearTimeout(resumeTimer);
+      resumeTimer = null;
+    }
+  }
+
+  function tryResume() {
+    if (!el || !enabled || ducked || document.hidden) return false;
+    if (!el.paused) { resumeTries = 0; return false; }
+    if (resumeTries >= 5) return false;
+    resumeTries += 1;
+    var pr = null;
+    try { pr = el.play(); } catch (e) { pr = null; }
+    if (pr && pr.catch) pr.catch(function () { /* ещё попробуем по таймеру */ });
+    return true;
+  }
+
+  function scheduleResume(delay) {
+    if (resumeTimer || resumeTries >= 5) return;
+    resumeTimer = window.setTimeout(function () {
+      resumeTimer = null;
+      if (tryResume()) scheduleResume(900);
+    }, delay || 500);
   }
 
   function tryNextCandidate() {
@@ -105,6 +152,12 @@
     };
     el.addEventListener('loadedmetadata', onReady);
     el.addEventListener('error', onError);
+    el.addEventListener('pause', function () {
+      /* пауза не по нашей воле, а музыка должна играть — вернёмся сами */
+      if (!enabled || ducked || document.hidden) return;
+      resumeTries = 0;
+      scheduleResume(600);
+    });
 
     /* на всякий случай: если событие так и не придёт, через 10 с пробуем дальше */
     window.setTimeout(function () {
@@ -331,6 +384,7 @@
   function applyVolume(ramp) {
     if (mode === 'track' && el) {
       rampTrack(volumeTarget(), ramp || 0.4);
+      if (!ducked) tryResume();
     } else if (mode === 'synth') {
       synthSetVolume(!enabled ? 0.0001 : (ducked ? CONFIG.duckVolume : CONFIG.volume * 1.6));
     }
@@ -340,6 +394,8 @@
     if (!enabled) {
       enabled = true;
       started = true;
+      resumeTries = 0;
+      cancelResume();
     }
     if (mode === 'track' && el) {
       playTrack();
@@ -362,6 +418,7 @@
 
   function stop() {
     enabled = false;
+    cancelResume();
     if (mode === 'track' && el) {
       rampTrack(0, 0.45);
       window.setTimeout(function () {
@@ -381,7 +438,48 @@
     var next = !!flag;
     if (ducked === next) return;
     ducked = next;
-    applyVolume(0.35);
+    cancelResume();
+    resumeTries = 0;
+    if (!enabled) return;
+
+    if (ducked) {
+      /* уступаем звук: музыка уходит на второй план */
+      if (mode === 'track' && el) {
+        if (volumeSettable) {
+          rampTrack(CONFIG.duckVolume, 0.35);
+        } else {
+          try { el.pause(); } catch (e) { /* ignore */ }
+        }
+      } else if (mode === 'synth') {
+        synthSetVolume(CONFIG.duckVolume);
+      }
+      return;
+    }
+
+    /* звук снова наш — возвращаем песню на место */
+    if (mode === 'track' && el) {
+      tryResume();
+      rampTrack(volumeTarget(), 0.55);
+    } else if (mode === 'synth') {
+      if (!loopTimer) synthStart();
+      synthSetVolume(CONFIG.volume * 1.6);
+    }
+  }
+
+  /* вернуть песню на место, если её «придержали» (например, звук живого кадра) */
+  function resume() {
+    if (!enabled) return;
+    cancelResume();
+    resumeTries = 0;
+    if (mode === 'track' && el) {
+      tryResume();                       /* синхронно: браузер ещё считает это жестом */
+      rampTrack(volumeTarget(), 0.6);
+      return;
+    }
+    if (mode === 'synth') {
+      if (!loopTimer) synthStart();
+      applyVolume(0.6);
+    }
   }
 
   /* ---------- реакция на сворачивание вкладки ---------- */
@@ -417,10 +515,12 @@
     get paused() { return mode === 'track' ? (!el || el.paused) : !enabled; },
     get position() { return el ? el.currentTime : 0; },
     get volume() { return el ? el.volume : 0; },
+    get ducked() { return ducked; },
     start: start,
     stop: stop,
     toggle: toggle,
     setDucked: setDucked,
+    resume: resume,
     onModeChange: function (fn) {
       modeChangeCallback = typeof fn === 'function' ? fn : null;
       if (modeChangeCallback && mode) modeChangeCallback(mode, currentTitle());
